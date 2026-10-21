@@ -1,128 +1,127 @@
-"""Crypto AI V6: public market data and simulation-only trading logic."""
-import time
+"""Crypto.com Exchange public market data and PAPER-ONLY strategy helpers."""
 import requests
 import pandas as pd
-import numpy as np
 
-COINS = {"BTC": ("bitcoin", "Bitcoin"), "ETH": ("ethereum", "Ethereum"), "SOL": ("solana", "Solana"), "ADA": ("cardano", "Cardano"), "XRP": ("ripple", "XRP")}
-BASE = "https://api.coingecko.com/api/v3"
-HEADERS = {"accept": "application/json", "User-Agent": "CryptoAIV6Educational/1.0"}
+BASE = 'https://api.crypto.com/exchange/v1'
+ASSETS = ('BTC', 'ETH', 'SOL', 'ADA', 'XRP')
+FEE = 0.001  # Hypothèse pédagogique, pas les frais réels de l'utilisateur.
 
-class MarketDataError(Exception):
+class MarketError(Exception):
     pass
 
-def api_get(path, params):
+def _get(method, params=None):
     try:
-        response = requests.get(f"{BASE}{path}", params=params, headers=HEADERS, timeout=20)
-        if response.status_code == 429:
-            raise MarketDataError("CoinGecko limite les requêtes (HTTP 429). Attends quelques minutes avant de réessayer.")
+        response = requests.get(f'{BASE}/public/{method}', params=params, timeout=15,
+                                headers={'Accept': 'application/json', 'User-Agent': 'CryptoAIV7-paper/1.0'})
         response.raise_for_status()
-        return response.json()
-    except requests.RequestException as exc:
-        raise MarketDataError(f"Connexion CoinGecko indisponible : {exc}") from exc
-    except ValueError as exc:
-        raise MarketDataError("Réponse CoinGecko illisible.") from exc
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        raise MarketError(f'API Crypto.com indisponible : {exc}') from exc
+    if str(payload.get('code', -1)) != '0':
+        raise MarketError(f"Crypto.com : {payload.get('message', 'erreur API')} (code {payload.get('code')})")
+    return payload.get('result', {})
 
-def fetch_prices():
-    ids = ",".join(item[0] for item in COINS.values())
-    data = api_get("/simple/price", {"ids": ids, "vs_currencies": "eur", "include_24hr_change": "true"})
-    result = {}
-    for symbol, (coin_id, name) in COINS.items():
-        item = data.get(coin_id, {})
-        price = item.get("eur")
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or not np.isfinite(price) or price <= 0:
-            continue
-        result[symbol] = {"name": name, "price": float(price), "change_24h": item.get("eur_24h_change")}
-    if not result:
-        raise MarketDataError("Aucun cours exploitable reçu de CoinGecko.")
-    return result
+def spot_pairs():
+    """Select actual spot USDT instruments, never derivatives or margin."""
+    data = _get('get-instruments').get('data', [])
+    selected = {}
+    for item in data:
+        base = item.get('base_ccy')
+        quote = item.get('quote_ccy')
+        kind = str(item.get('inst_type', '')).upper()
+        name = item.get('symbol') or item.get('instrument_name')
+        if base in ASSETS and quote == 'USDT' and kind == 'SPOT' and name and item.get('tradable', True) is not False:
+            selected[base] = name
+    return selected
 
-def fetch_history(symbol, days=90):
-    if symbol not in COINS or days not in (90, 180):
-        raise ValueError("Cryptomonnaie ou période invalide.")
-    data = api_get(f"/coins/{COINS[symbol][0]}/market_chart", {"vs_currency": "eur", "days": days})
-    points = data.get("prices", [])
-    if len(points) < 40:
-        raise MarketDataError("Historique insuffisant.")
-    df = pd.DataFrame(points, columns=["timestamp", "price"])
-    df["date"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df["price"] = pd.to_numeric(df["price"], errors="coerce")
-    daily = df.set_index("date")["price"].resample("1D").last().dropna()
-    daily = daily[daily > 0]
-    if len(daily) < 40:
-        raise MarketDataError("Moins de 40 clôtures quotidiennes disponibles.")
-    return daily
+def tickers(pairs):
+    if not pairs:
+        return {}
+    rows = _get('get-tickers').get('data', [])
+    by_name = {r.get('i'): r for r in rows}
+    output = {}
+    for asset, name in pairs.items():
+        row = by_name.get(name)
+        if row:
+            try:
+                price = float(row['a'])
+                change = float(row.get('c') or 0) * 100
+                if price > 0:
+                    output[asset] = {'pair': name, 'price': price, 'change': change,
+                                     'timestamp': pd.to_datetime(int(row['t']), unit='ms', utc=True) if row.get('t') else None}
+            except (ValueError, TypeError, KeyError):
+                continue
+    return output
 
-def indicators(prices):
-    s = pd.Series(prices, dtype=float)
+def history(pair, days=90):
+    result = _get('get-candlestick', {'instrument_name': pair, 'timeframe': '1D', 'count': days + 45})
+    rows = result.get('data', [])
+    if not rows:
+        raise MarketError('Aucune bougie historique retournée pour cette paire.')
+    frame = pd.DataFrame(rows)
+    try:
+        frame['date'] = pd.to_datetime(pd.to_numeric(frame['t']), unit='ms', utc=True)
+        frame['close'] = pd.to_numeric(frame['c'], errors='coerce')
+    except (KeyError, ValueError) as exc:
+        raise MarketError('Format des bougies inattendu.') from exc
+    series = frame.dropna(subset=['close']).set_index('date')['close'].sort_index()
+    series = series[~series.index.duplicated(keep='last')]
+    series = series[series > 0]
+    if len(series) < 40:
+        raise MarketError('Historique insuffisant (moins de 40 bougies).')
+    return series.tail(days + 35)
+
+def indicators(series):
+    s = series.astype(float)
     delta = s.diff()
-    gains = delta.clip(lower=0)
-    losses = -delta.clip(upper=0)
-    avg_gain = gains.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    avg_loss = losses.ewm(alpha=1/14, adjust=False, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    up = delta.clip(lower=0).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    down = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False, min_periods=14).mean()
+    rs = up / down.replace(0, float('nan'))
     rsi = 100 - 100 / (1 + rs)
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain > 0), 100)
-    rsi = rsi.mask((avg_loss == 0) & (avg_gain == 0), 50)
-    ema12 = s.ewm(span=12, adjust=False).mean()
-    ema26 = s.ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    return pd.DataFrame({"price": s, "sma10": s.rolling(10).mean(), "sma30": s.rolling(30).mean(), "rsi": rsi, "macd": macd, "macd_signal": signal}, index=s.index)
+    rsi = rsi.mask((down == 0) & (up > 0), 100).mask((down == 0) & (up == 0), 50)
+    macd = s.ewm(span=12, adjust=False).mean() - s.ewm(span=26, adjust=False).mean()
+    return pd.DataFrame({'Cours': s, 'SMA10': s.rolling(10).mean(), 'SMA30': s.rolling(30).mean(),
+                         'RSI': rsi, 'MACD': macd, 'Signal MACD': macd.ewm(span=9, adjust=False).mean()})
 
-STRATEGIES = {"Tendance + MACD": "trend", "Croisement SMA + RSI": "cross"}
+def decision(row, strategy):
+    if pd.isna(row['SMA30']) or pd.isna(row['RSI']):
+        return 'ATTENDRE'
+    if strategy == 'Tendance + MACD':
+        if row['SMA10'] > row['SMA30'] and row['MACD'] > row['Signal MACD'] and row['RSI'] < 70:
+            return 'ACHETER'
+        if row['SMA10'] < row['SMA30'] or row['RSI'] > 75:
+            return 'VENDRE'
+    else:
+        if row['SMA10'] > row['SMA30'] and row['RSI'] < 65:
+            return 'ACHETER'
+        if row['SMA10'] < row['SMA30'] or row['RSI'] > 75:
+            return 'VENDRE'
+    return 'CONSERVER'
 
-def signal_from_indicators(row, previous=None, strategy="trend"):
-    if pd.isna(row["sma10"]) or pd.isna(row["sma30"]) or pd.isna(row["rsi"]):
-        return "ATTENDRE", "Indicateurs insuffisants"
-    if strategy == "cross":
-        if previous is None or pd.isna(previous["sma10"]) or pd.isna(previous["sma30"]):
-            return "ATTENDRE", "Croisement non vérifiable"
-        if previous["sma10"] <= previous["sma30"] and row["sma10"] > row["sma30"] and row["rsi"] < 70:
-            return "ACHETER", "Croisement haussier des moyennes mobiles"
-        if previous["sma10"] >= previous["sma30"] and row["sma10"] < row["sma30"]:
-            return "VENDRE", "Croisement baissier des moyennes mobiles"
-        return "CONSERVER", "Aucun nouveau croisement"
-    if row["sma10"] > row["sma30"] and row["macd"] > row["macd_signal"] and row["rsi"] < 70:
-        return "ACHETER", "Tendance et MACD haussiers"
-    if row["sma10"] < row["sma30"] or row["rsi"] > 75:
-        return "VENDRE", "Tendance baissière ou RSI élevé"
-    return "CONSERVER", "Signal non confirmé"
-
-def portfolio_value(cash, positions, prices):
-    return float(cash) + sum(float(qty) * prices[s]["price"] for s, qty in positions.items() if s in prices)
-
-def backtest(prices, strategy="trend", fee=0.001, initial=10000.0):
-    """Signal at day t close, simulated execution at day t+1 close (optimistic)."""
-    df = indicators(prices).dropna(subset=["price"])
-    if len(df) < 40:
-        raise ValueError("Historique insuffisant pour le backtest.")
+def backtest(series, strategy, days=90, initial=10000.0):
+    """Signals at previous close, trades at next close; simplified, no slippage."""
+    frame = indicators(series)
     cash, units = float(initial), 0.0
-    equity, benchmark, trades = [], [], []
-    start_price = float(df.iloc[0]["price"])
-    for i in range(len(df)):
-        row = df.iloc[i]
-        price = float(row["price"])
-        if i >= 1:
-            prior = df.iloc[i-1]
-            before = df.iloc[i-2] if i >= 2 else None
-            action, _ = signal_from_indicators(prior, before, strategy)
-            if action == "ACHETER" and units <= 1e-12 and cash > 0:
-                spend = cash / (1 + fee)
-                cost = spend * fee
-                units = spend / price
-                cash -= spend + cost
-                trades.append({"Date": str(df.index[i].date()), "Action": "ACHAT", "Prix (€)": round(price, 6), "Frais (€)": round(cost, 3)})
-            elif action == "VENDRE" and units > 1e-12:
-                gross = units * price
-                cost = gross * fee
-                cash += gross - cost
-                units = 0.0
-                trades.append({"Date": str(df.index[i].date()), "Action": "VENTE", "Prix (€)": round(price, 6), "Frais (€)": round(cost, 3)})
-        equity.append(cash + units * price)
-        benchmark.append(initial * price / start_price)
-    curve = pd.DataFrame({"Stratégie": equity, "Achat-conservation": benchmark}, index=df.index)
-    drawdown = curve["Stratégie"] / curve["Stratégie"].cummax() - 1
-    returns = curve["Stratégie"].pct_change().dropna()
-    volatility = float(returns.std() * np.sqrt(365) * 100) if len(returns) > 1 else 0.0
-    return {"curve": curve, "trades": trades, "return_pct": (equity[-1] / initial - 1) * 100, "benchmark_pct": (benchmark[-1] / initial - 1) * 100, "max_drawdown_pct": float(drawdown.min() * 100), "volatility_pct": volatility}
+    curve, orders = [], []
+    start = max(30, len(frame) - days)
+    for i in range(start, len(frame)):
+        signal = decision(frame.iloc[i - 1], strategy)
+        price = float(frame['Cours'].iloc[i])
+        date = frame.index[i]
+        if signal == 'ACHETER' and units == 0 and cash > 0:
+            units = cash * (1 - FEE) / price
+            orders.append({'Date': date.date().isoformat(), 'Action': 'ACHAT', 'Prix USDT': round(price, 5)})
+            cash = 0.0
+        elif signal == 'VENDRE' and units > 0:
+            cash = units * price * (1 - FEE)
+            units = 0.0
+            orders.append({'Date': date.date().isoformat(), 'Action': 'VENTE', 'Prix USDT': round(price, 5)})
+        curve.append((date, cash + units * price))
+    if not curve:
+        raise MarketError('Historique trop court pour le backtest.')
+    values = pd.Series({d: v for d, v in curve}, name=strategy)
+    reference = frame['Cours'].iloc[start:]
+    hold = (reference / reference.iloc[0]) * initial
+    perf = (values.iloc[-1] / initial - 1) * 100
+    drawdown = ((values / values.cummax()) - 1).min() * 100
+    return values, hold.rename('Achat-conservation'), perf, drawdown, orders
