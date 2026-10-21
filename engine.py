@@ -22,16 +22,32 @@ def _get(method, params=None):
     return payload.get('result', {})
 
 def spot_pairs():
-    """Select actual spot USDT instruments, never derivatives or margin."""
+    """Spot USDT only. Older Exchange responses may omit inst_type."""
     data = _get('get-instruments').get('data', [])
     selected = {}
     for item in data:
-        base = item.get('base_ccy')
-        quote = item.get('quote_ccy')
-        kind = str(item.get('inst_type', '')).upper()
+        base = str(item.get('base_ccy') or '').upper()
+        quote = str(item.get('quote_ccy') or '').upper()
+        kind = str(item.get('inst_type') or '').upper()
         name = item.get('symbol') or item.get('instrument_name')
-        if base in ASSETS and quote == 'USDT' and kind == 'SPOT' and name and item.get('tradable', True) is not False:
-            selected[base] = name
+        if not name or base not in ASSETS or quote != 'USDT':
+            continue
+        if item.get('tradable') is False:
+            continue
+        # Never accept derivatives, even if the instrument name looks similar.
+        if kind and kind != 'SPOT':
+            continue
+        # Missing inst_type is permitted only for unambiguous spot names.
+        if str(name).upper() not in (f'{base}_USDT', f'{base}USDT', f'{base}-USDT'):
+            continue
+        selected[base] = name
+    if not selected:
+        quotes = sorted({str(x.get('quote_ccy', '')) for x in data if x.get('base_ccy') in ASSETS})
+        raise MarketError(
+            f'Aucune paire spot USDT compatible parmi {len(data)} instruments reçus. '
+            f'Devises disponibles pour nos cryptos : {", ".join(quotes) or "aucune"}. '
+            'Le marché USDT peut ne pas être proposé par cette API.'
+        )
     return selected
 
 def tickers(pairs):
